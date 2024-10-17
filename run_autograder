@@ -46,7 +46,7 @@ def grader():
     
     test = AutograderTest(name="Grading Script", points=100, score=0)
     ag.tests.append(test)
-    res = run_command('/autograder/git/testscript /autograder/build/release/bigshell', cwd='/home/guest', timeout=300)
+    res = run_command('/autograder/git/testscript /autograder/build/release/circle', cwd='/home/guest', timeout=300)
     converter = Ansi2HTMLConverter(inline=True, line_wrap=False)
     html = converter.convert(res.stdout.decode(encoding="utf8", errors="replace"), full=False, ensure_trailing_newline=True);
     test.output += html
