@@ -9,11 +9,11 @@ all: $(TARGETS)
 compile_commands.json:
 	bear -- $(MAKE) -B all
 
-EXE := bigshell
+EXE := circle
 SRCS := $(shell find src -type f -name '*.c')
 OBJS := $(SRCS:src/%.c=%.o)
 
-CFLAGS = -std=c99 -Wall -Werror=vla
+CFLAGS = -std=gnu99 -Wall -Werror=vla
 release: CFLAGS += -O3 
 debug: CFLAGS += -g -O0
 
