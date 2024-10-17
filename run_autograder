@@ -1,0 +1,118 @@
+#!/usr/bin/env python3 
+from autograder import Autograder, AutograderTest, RunCommand, bytes2html
+from ansi2html import Ansi2HTMLConverter
+import os
+import json
+import random
+import regex as re
+import shutil
+import itertools
+import errno
+import seccomp
+import socket
+import shutil
+import datetime
+import time
+
+filter = seccomp.SyscallFilter(seccomp.ALLOW)
+for network in [socket.AF_INET, socket.AF_INET6]:
+    filter.add_rule(
+        seccomp.ERRNO(errno.EACCES),
+        "socket",
+        seccomp.Arg(0, seccomp.EQ, network),
+    )
+filter.load()
+
+run_command = RunCommand()
+inappropriate_error_msg = None
+os.environ["TERM"] = 'xterm-256color'
+
+def grader():
+    ag = Autograder()
+    
+    os.makedirs('/autograder/build', exist_ok=True)
+    shutil.copytree('/autograder/submission', '/autograder/build', dirs_exist_ok=True)
+       
+    os.chmod('/autograder/build', 0o777)
+    test = AutograderTest(name='Compiles')
+    ag.tests.append(test)
+    run_command("make clean -f /autograder/git/extra/bigshell.makefile", cwd='/autograder/build')
+    res = run_command("make release -f /autograder/git/extra/bigshell.makefile", cwd='/autograder/build')
+    if res.returncode != 0:
+        test.output = res.html(stdin=None)
+        test.failing = True
+        return ag
+    test.passing = True
+    
+    test = AutograderTest(name="Grading Script", points=100, score=0)
+    ag.tests.append(test)
+    res = run_command('/autograder/git/testscript /autograder/build/release/bigshell', cwd='/home/guest', timeout=300)
+    converter = Ansi2HTMLConverter(inline=True, line_wrap=False)
+    html = converter.convert(res.stdout.decode(encoding="utf8", errors="replace"), full=False, ensure_trailing_newline=True);
+    test.output += html
+    print(str(res.stderr, encoding="utf8"))
+    try:
+        f = open('/autograder/results/score', "r")
+        test.score = int(f.readline())
+    except:
+        test.output += "\n\nThe grading script did not output a final score for gradescope. This may be a bug; please contact your instructor.\n"
+    
+    return ag
+
+print("Calculating late penalties")
+
+with open("/autograder/submission_metadata.json", "r") as f:
+    metadata = json.load(f)
+
+sub_date = datetime.datetime.fromisoformat(metadata["created_at"])
+
+due_dates = []
+late_dates = []
+
+if metadata["users"]:
+    for user in metadata["users"]:
+        due_dates.append(datetime.datetime.fromisoformat(user["assignment"]["due_date"]))
+        late_dates.append(
+            datetime.datetime.fromisoformat(user["assignment"]["late_due_date"])
+        )
+    due_date = min(due_dates)
+    if late_dates:
+        late_date = min(late_dates)
+    else:
+        late_date = due_date
+else:
+    due_date = metadata["assignment"]["due_date"]
+    late_date = metadata["assignment"]["late_due_date"] or metadata["assignment"]["due_date"]
+
+
+
+print("due at: {}".format(due_date))
+print("late at: {}".format(late_date))
+print("submitted at: {}".format(sub_date))
+
+late_amt = max(datetime.timedelta(), sub_date - due_date)
+print("Late by: {}".format(late_amt))
+
+late_penalty = late_amt / datetime.timedelta(days=1) * 0.1
+print("Penalty: {:.2%}".format(late_penalty))
+
+with open("/autograder/results/results.json", "w+") as f:
+    ag = grader()
+    results = dict(ag)
+    if late_penalty > 0:
+        old_score = results["score"]
+        new_score = round(old_score * (1 - late_penalty), 2)
+        results["score"] = new_score
+        results["tests"].append(
+            {
+                "name_format": "html",
+                "name": "Late Penalty",
+                "output_format": "html",
+                "status": "failed",
+                "output": "<p>Submission at <strong>{}</strong> was late by <strong>{}</strong>.</p><p>Late penalty: <strong>{:.2%}</strong>.</p><p>Your score was reduced from <strong>{:.2f}</strong> to <strong>{:.2f}</strong></p>".format(
+                    sub_date, late_amt, late_penalty, old_score, new_score
+                ),
+            }
+        )
+
+    f.write(json.dumps(results))

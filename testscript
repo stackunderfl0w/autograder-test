@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+
+set +x # Tracing for debugging output
+set -e # Exit on error during setup
+umask 077
+
+readonly srcdir="$(realpath $(dirname $0))"
+readonly target_exe="$(realpath "${1:-./circle}")"
+readonly workdir="$(mktemp -d)"
+readonly sandbox="$(mktemp -d)"
+
+if [ ! -x "$target_exe" ] ||
+   [ ! -f "${target_exe}" ]
+then
+  printf '%s does not appear to be an executable file\n' "${target_exe}"
+  printf 'Usage: %s [TARGET_EXE]\n' "$0"
+  printf 'TARGET_EXE defaults to "./circle", if not provided\n'
+  exit 1
+fi
+{
+builddir=$(mktemp -d)
+pushd "${builddir}" 
+"${srcdir}"/util/configure --prefix="$(realpath ${workdir})" && make install
+popd 
+rm -rf "${builddir}"
+} &>/dev/null
+
+chmod go=rX ${workdir}
+chmod -R go=rX ${workdir}/bin
+export PATH="$(realpath ${workdir})/bin${PATH+:$PATH}"
+export PS1='
+\$ '
+
+microsleep() {
+   sleep 0.1
+}
+
+###############################################################################
+#
+# I/O pipes
+mkdir -p "${workdir}/pipes"
+for pipe in stdin_pipe
+do
+  readonly "${pipe}=${workdir}/pipes/${pipe}"
+  mkfifo "${!pipe}"
+done
+trap '' SIGPIPE
+
+###############################################################################
+#
+# Manager
+
+declare -i testcount=0 \
+           total_score=0 \
+           total_value=0
+
+trap 'trap - ERR EXIT
+printf "\n\nFinal score: %d / %d\n" "${total_score}" "${total_value}"
+printf "%d\n" "${total_score}" > /autograder/results/score
+popd &>/dev/null
+trace_end &>/dev/null
+lsof +D "${workdir}" -t | grep -v $$ | xargs -r kill -9 
+while ! rm -rf "${workdir}" &>/dev/null 
+do 
+  sleep 0.5 
+done 
+lsof +D "${sandbox}" -t | grep -v $$ | xargs -r kill -9 
+while ! rm -rf "${sandbox}" &>/dev/null 
+do 
+  sleep 0.5 
+done 
+exit 1' EXIT SIGINT
+
+# ROOT pid
+# TERM pid signo signame
+# EXIT pid status
+# FORK pid child
+# SIGNAL pid signo signame
+# ERROR
+# DIE pid
+# KILLED pid
+
+trace_get() {
+  $srcdir/awk/$1.awk ${trace_log}
+}
+
+trace_input() {
+  for cmd
+  do
+    microsleep
+    printf '%s\n' "$cmd" >&3
+  done
+  microsleep
+  cat >&3
+} &>/dev/null
+
+trace_start() {
+  local args=("$@")
+  if {
+    [ "${tracer_pid+x}" = x ] || 
+    command >&3 
+  } &>/dev/null
+  then
+    echo 'Error: tracer already running' >&2
+    exit 1
+  fi
+
+  # Reset i/o 
+  { : <>"${stdin_pipe}" \
+      >"${trace_log}" \
+      >"${trace_err}"
+  } &>/dev/null
+
+  # Spawn a new traced bigshell process
+  
+  ( 
+    trap - SIGINT # Reset signal disposition to SIG_DFL
+    exec tracer -u guest -c 10 -l 512 -o "${trace_log}" -e "${trace_err}" \
+        "${target_exe}" "${args[@]}" 0<"${stdin_pipe}" 1>>"${stdout}" 2>>"${stderr}" 
+  ) &
+  tracer_pid=$!
+  # Attach fd number 3 to bigshell's input 
+  exec 3>"${stdin_pipe}"
+  trace_start_time=$EPOCHSECONDS
+  while true
+  do
+    bigshell_pid="$(trace_get tracee_pid)"
+    if [ -n "$bigshell_pid" ]
+    then
+      break
+    fi
+    microsleep
+    if [ $((EPOCHSECONDS - trace_start_time)) -gt 5 ]
+    then
+      echo 'Error: failed to establish trace in time limit' >&2
+      exit 1
+    fi
+  done
+
+  return 0
+}
+
+trace_end() {
+  # Close the file descriptor attached to bigshell's input
+  exec 3>&-
+  
+  trace_end_time=$EPOCHSECONDS
+  while 
+    kill -0 "$tracer_pid" &>/dev/null
+  do
+    microsleep
+    # Take increasingly drastic measures
+    if [ $((EPOCHSECONDS - trace_end_time)) -gt  1 ]
+    then 
+      kill -SIGKILL "${bigshell_pid}"
+      sleep 1
+    elif [ $((EPOCHSECONDS - trace_end_time)) -gt 2 ]
+    then 
+      kill -SIGKILL "${tracer_pid}"
+      sleep 1
+    elif [ $((EPOCHSECONDS - trace_end_time)) -gt 3 ]
+    then 
+      echo "Error: tracer won't exit" >&2
+      exit 1
+    fi
+  done
+  unset tracer_pid
+  return 0
+}
+
+set +e
+
+###############################################################################
+#
+# Test functions
+
+
+test_start()
+{
+  shopt -s dotglob
+  rm -rf *
+  shopt -u dotglob
+  testdir="${workdir}/results/${testcount}"
+  mkdir -p "${testdir}"
+  mkdir -p "${sandbox}/fakehome"
+  HOME="${sandbox}/fakehome"
+  chmod -R go=wrX "${sandbox}"
+  
+  test_value="$1"
+  shift
+  test_name="Test $testcount: $@"
+
+  cat >"${testdir}/descr"
+
+  unset test_score test_passed
+  subtestcount=0
+  subtest_start
+  : $((++testcount))
+}
+
+subtest_start()
+{
+  subtestdir="${testdir}/${subtestcount}"
+  mkdir -p "${subtestdir}"
+  for file in stdout stderr trace_log trace_err
+  do
+    declare -g "${file}=${subtestdir}/${file}"
+    rm -f "${subtestdir}/${file}"
+  done
+  : $((++subtestcount))
+}
+
+nspaces()
+{
+  printf '%'"${1:-64}"'s' ''
+}
+
+test_end()
+{
+  tput setaf 4 bold 
+ 
+  printf '\n'
+  fold -sw 60 <<<"$test_name" |
+  while read
+  do
+    printf '  %-60s  \n' "$REPLY"
+  done
+  nspaces | sed 's/./▅/g'
+  printf '\n'
+  tput sgr0
+
+  if [ -f "${testdir}/descr" ] && [ -s "${testdir}/descr" ]
+  then
+    tput smul
+    printf 'Description'
+    tput sgr0
+    
+    printf '\n'
+
+    fold -sw64 "${testdir}/descr"
+  fi
+
+  printf '\n'
+
+  i=0
+  while [ $i -lt "$subtestcount" ]
+  do
+    subtestdir="${testdir}/$i"
+    : $((++i))
+    if [ "$subtestcount" -gt 1 ]
+    then
+      tput setaf 4 bold
+      printf 'Subtest %d\n' "$i"
+      printf 'Subtest %d' "$i" | sed 's/./🮂/g'
+      tput sgr0
+      printf '\n'
+    fi
+
+    tput smul
+    printf 'Output\n'
+    tput sgr0
+    
+    if [ -f "${subtestdir}/stdout" ] &&
+       [ -s "${subtestdir}/stdout" ]
+    then
+      fold -sw64 "${subtestdir}/stdout" 
+    else
+      printf 'No output\n'
+    fi
+    
+    if [ -f "${subtestdir}/scoring" ] &&
+      [ -s "${subtestdir}/scoring" ]
+    then
+      printf '\n'
+      tput smul
+      printf 'Scoring'
+      tput sgr0
+      printf '\n'
+      tput setaf 5
+      fold -sw64 "${subtestdir}/scoring"
+      tput sgr0
+    else
+      printf '\n'
+    fi
+    printf '\n'
+  done
+  
+  tput setaf bold
+  if 
+    [ "${test_passed:=1}" -ne 0 ] || 
+    [ "${test_score:=0}" -ge "${test_value:=0}" ]
+  then
+    : "${test_score:=${test_value}}"
+    tput setaf 2
+  else
+    : "${test_score:=0}"
+    tput setaf 1
+  fi
+  printf 'Overall Test Score: \n%d / %d\n' "${test_score}" "${test_value}"
+  : $((total_score += test_score))
+  : $((total_value += test_value))
+  tput sgr0
+} 2>/dev/null
+
+subtest_info()
+{
+  for arg
+  do
+    printf '%s\n' "$arg"
+  done
+  cat
+} >> "${subtestdir}/scoring"
+
+subtest_check_status()
+{
+  set -- "$(trace_get status)" "${1:-exited}" "${2:-0}"
+  if [ "${1}" == exited ]
+  then
+    set -- "$(trace_get exitstatus)" "$@"
+  elif [ "${1}" == signaled ]
+  then
+    set -- "$(trace_get termsig)" "$@"
+  fi
+  
+  # int stat tstat tint
+  if [ "${2}" != "${3}" ] || [ "${1}" -ne "${4}" ]
+  then
+    subtest_info "Incorrect exit status: ${2} ${1}. Expected ${3} ${4}."
+    return 1
+  fi
+
+  return 0
+}
+
+# check_stdout() {
+#   cat > reference
+#   if
+#     ! cmp -s "${stdout}" reference >&/dev/null
+#   then
+#     passed=0
+#     tput setaf 1
+#     printf '* Unexpected output (or lack of output) on stdout\n'
+#     if [ -s reference ]
+#     then
+#       printf '  Expected:\n'
+#       paste reference | sed "s/^/$(tput setaf 1)  |$(tput sgr0) /"
+#     fi
+#     tput sgr0
+#   fi
+#   return 0
+# }
+# 
+# check_file() {
+#   if [ "$#" -lt 1 ]
+#   then
+#     printf 'Error in grading script. Missing filename in check_file\n'
+#     exit 1
+#   fi
+#   cat > reference
+#   if
+#     ! cmp -s "$1" reference >&/dev/null
+#   then
+#     passed=0
+#     tput setaf 1
+#     printf '* Unexpected contents of `%s`\n' "$1"
+#     if [ -s reference ]
+#     then
+#       printf '  Expected:\n'
+#       paste reference | sed "s/^/$(tput setaf 1)  |$(tput sgr0) /"
+#     fi
+#     tput sgr0
+#   fi
+#   return 0
+# }
+#
+#
+# Make sure stdin never gets used 
+exec 0</dev/null
+
+# Switch to the sandbox directory
+pushd "${sandbox}" &>/dev/null
+
+# =================== BEGIN GRADING SCRIPT TESTS =================== #
+# __________________________________________________________________ #
+
+
+
+
+test_start 100 'Does circle calculate the correct value [100%]'
+
+# Generate a random radius value between 4 and 126
+radius=$((RANDOM % 123 + 4))
+
+# Calculate the expected area of the circle (Area = pi * radius^2)
+expected_area=$(awk "BEGIN {printf \"%.2f\", 3.14159265358979323846 * $radius * $radius}")
+
+# Start tracing the 'circle' program and pass the radius as an argument
+trace_start "$radius"
+
+# Check if the output contains the expected value
+if [ "$(grep -cF "$expected_area" "${stdout}")" -ne 1 ]; then
+  subtest_info "Expected to see area $expected_area exactly once in the output."
+  test_passed=0
+fi
+
+trace_end
+test_end
+
+
