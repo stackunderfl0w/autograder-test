@@ -26,7 +26,8 @@ rm -rf "${builddir}"
 } &>/dev/null
 
 chmod go=rX ${workdir}
-[ -d "${workdir}/bin" ] && chmod -R go=rX "${workdir}/bin" && export PATH="$(realpath ${workdir})/bin${PATH+:$PATH}"
+chmod -R go=rX ${workdir}/bin
+export PATH="$(realpath ${workdir})/bin${PATH+:$PATH}"
 export PS1='
 \$ '
 
